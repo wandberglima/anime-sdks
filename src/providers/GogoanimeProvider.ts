@@ -39,7 +39,9 @@ export class GogoanimeProvider extends BaseProvider {
     options: CallOptions = {},
   ): Promise<IMediaSearchResult[]> {
     const searchUrl = `${this.baseUrl}/browser?keyword=${encodeURIComponent(query)}`;
-    const response = await this.http.get(searchUrl, { signal: options.signal });
+    const response = await this.http.get(searchUrl, {
+      signal: options.signal ?? AbortSignal.timeout(7000),
+    });
     if (response.status !== 200) {
       throw new Error(`GogoAnime search failed with status ${response.status}`);
     }

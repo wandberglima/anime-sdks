@@ -10,6 +10,7 @@ import {
   IVideoPayload,
   ISubtitleTrack,
 } from '../types/index.js';
+import { megaPlaySourceUrl } from '../utils/megaplay.js';
 
 export class AnikotoProvider extends BaseProvider {
   public override readonly id = 'anikoto';
@@ -124,14 +125,15 @@ export class AnikotoProvider extends BaseProvider {
     );
 
     const sourcesJson = (await sourcesResponse.json()) as any;
-    if (!sourcesJson.sources || !sourcesJson.sources.file) {
+    const sourceUrl = megaPlaySourceUrl(sourcesJson);
+    if (!sourceUrl) {
       throw new Error('No video sources found in megaplay response');
     }
 
     const streams: IVideoPayload[] = [
       {
-        sourceUrl: sourcesJson.sources.file,
-        isHLS: sourcesJson.sources.file.includes('.m3u8'),
+        sourceUrl,
+        isHLS: /\.m3u8(\?|$)/i.test(sourceUrl),
         quality: 'auto',
         language,
         headers: {

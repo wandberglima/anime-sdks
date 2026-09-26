@@ -81,6 +81,9 @@ const CORS = {
   'Access-Control-Expose-Headers': '*',
 };
 
+const STREAM_FAILURE_TTL_MS = 10 * 60 * 1000;
+const streamFailureMemo = new Map<string, number>();
+
 function json(res: http.ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
   res.writeHead(status, {
@@ -950,10 +953,24 @@ export function startServer(options: ServerOptions): http.Server {
           if (!contentProvider) return err(res, 400, 'Missing or unknown param: contentProvider');
           const epNum = parseFloat(episode);
           if (!Number.isFinite(epNum)) return err(res, 400, 'Param `episode` must be numeric');
-          let stream = await cached(
-            `meta:stream:${meta.id}:${id}:${contentProvider.id}:${epNum}:${language ?? ''}`,
-            () => meta.resolveStream(id, epNum, contentProvider, language ?? undefined),
-          );
+          const streamCacheKey = `meta:stream:${meta.id}:${id}:${contentProvider.id}:${epNum}:${language ?? ''}`;
+          const failedExpiry = streamFailureMemo.get(streamCacheKey);
+          if (failedExpiry && failedExpiry > Date.now()) {
+            return err(
+              res,
+              500,
+              `No stream available for episode ${epNum} on provider "${contentProvider.id}" (cached)`,
+            );
+          }
+          let stream;
+          try {
+            stream = await cached(streamCacheKey, () =>
+              meta.resolveStream(id, epNum, contentProvider, language ?? undefined),
+            );
+          } catch (e) {
+            streamFailureMemo.set(streamCacheKey, Date.now() + STREAM_FAILURE_TTL_MS);
+            return err(res, 500, e instanceof Error ? e.message : String(e));
+          }
           if (proxy) stream = proxyifyStream(stream, proxyBase, proxySignSecret);
           return json(res, 200, stream);
         }
