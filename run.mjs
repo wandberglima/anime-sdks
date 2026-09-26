@@ -16,6 +16,7 @@ import {
   AnilistMeta,
   MalMeta,
   KitsuMeta,
+  MappingClient,
 } from './dist/index.js';
 
 const DEB = (m) => (process.env.DEBUG ? console.log('[rotator]', m) : undefined);
@@ -57,6 +58,8 @@ const DNS_RESOLVERS = [
 ];
 
 const aleatorio = (lista) => lista[Math.floor(Math.random() * lista.length)];
+
+const SKIP_HOSTS = new Set(['api.anify.tv', 'arm.haglund.dev']);
 
 function cabecalhosRotativos(base = {}) {
   const headers = { ...base };
@@ -107,14 +110,17 @@ function respostaComposta(bloco, urlFinal) {
     else if (v !== undefined) headers.append(k, String(v));
   }
   const status = bloco.status || 200;
-  return Object.assign(
-    new Response(new Uint8Array(bloco.buf), {
-      status,
-      statusText: status === 200 ? 'OK' : 'HTTP',
-      headers,
-    }),
-    { url: urlFinal },
-  );
+  const resposta = new Response(new Uint8Array(bloco.buf), {
+    status,
+    statusText: status === 200 ? 'OK' : 'HTTP',
+    headers,
+  });
+  try {
+    Object.defineProperty(resposta, 'url', { value: urlFinal, configurable: true });
+  } catch {
+    // getter do Response nativo é read-only em alguns runtimes; segue sem url
+  }
+  return resposta;
 }
 
 async function requisicaoDireta(parts, init, redirectsRestantes) {
@@ -196,17 +202,34 @@ class TransporteRotativo {
 
   async fetch(urlStr, init) {
     const headers = cabecalhosRotativos(init.headers || {});
-    try {
-      if (!process.env.PROXY_URL && urlStr.startsWith('https://')) {
-        const viaIp = await resolverIpENovo(urlStr, init.method || 'GET', 4, headers);
-        DEB('OK via DNS aleatorio');
-        return viaIp;
+    const precisaRotacionar = !process.env.PROXY_URL && urlStr.startsWith('https://');
+    if (precisaRotacionar) {
+      const host = new URL(urlStr).hostname;
+      if (SKIP_HOSTS.has(host)) {
+        DEB(`skip ${host} (bloqueado/sem resposta util)`);
+        return new Response(JSON.stringify({ error: `host skipped: ${host}` }), {
+          status: 502,
+          headers: { 'Content-Type': 'application/json' },
+        });
       }
-      return this.base.fetch(urlStr, { ...init, headers });
-    } catch (e) {
-      DEB(`fallback (${e?.message})`);
-      return this.base.fetch(urlStr, { ...init, headers });
     }
+    if (!precisaRotacionar) return this.base.fetch(urlStr, { ...init, headers });
+    try {
+      const viaBase = await this.base.fetch(urlStr, { ...init, headers });
+      const bloqueado = [403, 429, 502, 503].includes(viaBase?.status);
+      if (!bloqueado) return viaBase;
+      DEB(`base ${viaBase.status} -> tenta DNS aleatorio`);
+    } catch (e) {
+      DEB(`base falhou (${e?.message}) -> tenta DNS aleatorio`);
+    }
+    try {
+      const viaIp = await resolverIpENovo(urlStr, init.method || 'GET', 4, headers);
+      DEB('OK via DNS aleatorio');
+      return viaIp;
+    } catch (e) {
+      DEB(`DNS aleatorio falhou (${e?.message}) -> base`);
+    }
+    return this.base.fetch(urlStr, { ...init, headers });
   }
 }
 
@@ -224,6 +247,8 @@ const cache = {
   set: (key, value) => store.set(key, value),
 };
 
+const mapping = new MappingClient(http, { disableAnify: true, disableArmServer: true });
+
 const port = Number(process.env.PORT ?? 3001);
 
 startServer({
@@ -238,7 +263,11 @@ startServer({
     new WeebcentralProvider(http),
     new MangapillProvider(http),
   ],
-  metaProviders: [new AnilistMeta(http), new MalMeta(http), new KitsuMeta(http)],
+  metaProviders: [
+    new AnilistMeta(http, { mappingClient: mapping }),
+    new MalMeta(http, { mappingClient: mapping }),
+    new KitsuMeta(http, { mappingClient: mapping }),
+  ],
   port,
   proxy: false,
   cache,
