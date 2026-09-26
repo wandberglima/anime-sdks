@@ -1,0 +1,8 @@
+{
+  "buildCommand": "npm run build",
+  "functions": {
+    "api/server.ts": {
+      "maxDuration": 60
+    }
+  }
+}
