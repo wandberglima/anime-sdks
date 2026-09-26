@@ -1,8 +1,10 @@
 {
-  "buildCommand": "npm run build",
+  "installCommand": "npm install && npm run build",
+  "buildCommand": "mkdir -p public && echo ok > public/index.html",
   "functions": {
     "api/server.ts": {
       "maxDuration": 60
     }
-  }
+  },
+  "rewrites": [{ "source": "/(.*)", "destination": "/api/server" }]
 }
