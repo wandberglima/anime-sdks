@@ -5,6 +5,7 @@ import {
   GogoanimeProvider,
   GoyabuProvider,
   MegaPlayProvider,
+  HianimeProvider,
   AllmangaProvider,
   MangadexProvider,
   WeebcentralProvider,
@@ -30,10 +31,33 @@ const cache = {
 
 let portPromise: Promise<number> | null = null;
 
+class RetryTransport {
+  constructor(private base: { fetch(url: string, init?: unknown): Promise<unknown> }) {}
+
+  async fetch(url: string, init?: unknown): Promise<unknown> {
+    let ultimoErro: unknown;
+    for (let tentativa = 0; tentativa < 4; tentativa++) {
+      try {
+        const res = (await this.base.fetch(url, init)) as { status?: number } | null;
+        if (res && res.status !== undefined && ![502, 503].includes(res.status)) {
+          return res;
+        }
+      } catch (e) {
+        ultimoErro = e;
+      }
+    }
+    if (ultimoErro) throw ultimoErro;
+    return this.base.fetch(url, init);
+  }
+}
+
 function internalServer(): Promise<number> {
   portPromise ??= new Promise<number>((resolve, reject) => {
     try {
-      const httpClient = new HttpClient({ timeoutMs: 30000, transport: new FetchTransport() });
+      const httpClient = new HttpClient({
+        timeoutMs: 30000,
+        transport: new RetryTransport(new FetchTransport()),
+      });
       const mapping = new MappingClient(httpClient, {
         disableAnify: true,
         disableArmServer: true,
@@ -46,6 +70,7 @@ function internalServer(): Promise<number> {
           new AnimeParadiseProvider(httpClient),
           new AnikotoProvider(httpClient),
           new MegaPlayProvider(httpClient),
+          new HianimeProvider(httpClient),
           new MangadexProvider(httpClient),
           new WeebcentralProvider(httpClient),
           new MangapillProvider(httpClient),

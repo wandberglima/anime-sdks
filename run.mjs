@@ -10,6 +10,7 @@ import {
   AnimeParadiseProvider,
   AnikotoProvider,
   MegaPlayProvider,
+  HianimeProvider,
   MangadexProvider,
   WeebcentralProvider,
   MangapillProvider,
@@ -78,8 +79,8 @@ function cabecalhosRotativos(base = {}) {
   return headers;
 }
 
-async function resolverDnsAleatorio(hostname) {
-  const servers = aleatorio(DNS_RESOLVERS);
+async function resolverDnsAleatorio(hostname, servidores) {
+  const servers = servidores ?? aleatorio(DNS_RESOLVERS);
   const r = new dns.promises.Resolver();
   r.setServers(servers);
   return new Promise((resolveFinal) => {
@@ -176,12 +177,14 @@ async function requisicaoDireta(parts, init, redirectsRestantes) {
   });
 }
 
-async function resolverIpENovo(urlStr, metodo, redirectsRestantes, headers) {
+async function resolverIpENovo(urlStr, metodo, redirectsRestantes, headers, signal, indiceDns) {
   const url = new URL(urlStr);
   if (url.protocol !== 'https:') {
     throw new Error('nao-https');
   }
-  const ip = await resolverDnsAleatorio(url.hostname);
+  const servidores =
+    indiceDns != null ? DNS_RESOLVERS[indiceDns % DNS_RESOLVERS.length] : undefined;
+  const ip = await resolverDnsAleatorio(url.hostname, servidores);
   if (!ip) {
     throw new Error(`dns-falhou: ${url.hostname}`);
   }
@@ -190,7 +193,7 @@ async function resolverIpENovo(urlStr, metodo, redirectsRestantes, headers) {
   DEB(`${url.hostname} -> ${ip}`);
   return requisicaoDireta(
     { ipUrl: copia.href, host: url.host, sni: url.hostname, base: url.href },
-    { method: metodo, headers, signal: undefined, body: undefined },
+    { method: metodo, headers, signal, body: undefined },
     4,
   );
 }
@@ -214,20 +217,56 @@ class TransporteRotativo {
       }
     }
     if (!precisaRotacionar) return this.base.fetch(urlStr, { ...init, headers });
+
+    // 1ª tentativa: transporte base. Bloqueio HTTP (403/429/502/503) recebe um
+    // único fallback por DNS. Erro de REDE dispara a política exigida: até 3
+    // novas tentativas no MESMO provider, cada uma com um servidor DNS diferente,
+    // sempre respeitando o signal de abort para não travar a execução.
+    let erroDeRede = false;
     try {
       const viaBase = await this.base.fetch(urlStr, { ...init, headers });
       const bloqueado = [403, 429, 502, 503].includes(viaBase?.status);
       if (!bloqueado) return viaBase;
-      DEB(`base ${viaBase.status} -> tenta DNS aleatorio`);
+      DEB(`base ${viaBase.status} -> fallback DNS (1x)`);
+      try {
+        const viaIp = await resolverIpENovo(urlStr, init.method || 'GET', 4, headers);
+        DEB('OK via DNS (bloqueio HTTP)');
+        return viaIp;
+      } catch (e) {
+        DEB(`fallback DNS falhou (${e?.message})`);
+      }
+      return this.base.fetch(urlStr, { ...init, headers });
     } catch (e) {
-      DEB(`base falhou (${e?.message}) -> tenta DNS aleatorio`);
+      erroDeRede = true;
+      DEB(`base falhou por rede (${e?.message}) -> 3 retries DNS`);
     }
-    try {
-      const viaIp = await resolverIpENovo(urlStr, init.method || 'GET', 4, headers);
-      DEB('OK via DNS aleatorio');
-      return viaIp;
-    } catch (e) {
-      DEB(`DNS aleatorio falhou (${e?.message}) -> base`);
+
+    if (erroDeRede) {
+      const dnsInicial = Math.floor(Math.random() * DNS_RESOLVERS.length);
+      let ultimoErro;
+      for (let tentativa = 0; tentativa < 3; tentativa++) {
+        if (init.signal?.aborted) throw new Error('abortado');
+        try {
+          const viaIp = await resolverIpENovo(
+            urlStr,
+            init.method || 'GET',
+            4,
+            headers,
+            init.signal,
+            dnsInicial + tentativa,
+          );
+          DEB(`retry DNS ${tentativa + 1}/3 OK`);
+          return viaIp;
+        } catch (e) {
+          ultimoErro = e;
+          DEB(`retry DNS ${tentativa + 1}/3 falhou (${e?.message})`);
+        }
+      }
+      try {
+        return await this.base.fetch(urlStr, { ...init, headers });
+      } catch (e) {
+        throw new Error(`fetch falhou apos retries (${e?.message ?? ultimoErro?.message})`);
+      }
     }
     return this.base.fetch(urlStr, { ...init, headers });
   }
@@ -259,6 +298,7 @@ startServer({
     new AnimeParadiseProvider(http),
     new AnikotoProvider(http),
     new MegaPlayProvider(http),
+    new HianimeProvider(http),
     new MangadexProvider(http),
     new WeebcentralProvider(http),
     new MangapillProvider(http),

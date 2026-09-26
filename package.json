@@ -56,5 +56,10 @@
     "tsup": "^8.5.1",
     "typescript": "^5.4.5",
     "vitest": "^4.1.8"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
   }
 }

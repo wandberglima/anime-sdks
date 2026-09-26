@@ -26,6 +26,7 @@ export * from './providers/GoyabuProvider.js';
 export * from './providers/AnikotoProvider.js';
 export * from './providers/MegaPlayProvider.js';
 export * from './providers/AnimeParadiseProvider.js';
+export * from './providers/HianimeProvider.js';
 export * from './providers/MangadexProvider.js';
 export * from './providers/WeebcentralProvider.js';
 export * from './providers/MangapillProvider.js';
