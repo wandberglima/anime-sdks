@@ -1,0 +1,12 @@
+services:
+  scraper:
+    image: ghcr.io/wandberglima/anime-sdks:latest
+    container_name: anime-scraper
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      PORT: "3001"
+      # PROXY_URL: "http://usuario:senha@ip-do-proxy:porta"
+      # PROXY_TYPE: "prepend"
+      # DEBUG: "false"
