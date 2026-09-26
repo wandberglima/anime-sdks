@@ -10,12 +10,12 @@
   "author": "hexxt-git",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/hexxt-git/anime-sdk.git"
+    "url": "git+https://github.com/wandberglima/anime-sdks.git"
   },
   "bugs": {
-    "url": "https://github.com/hexxt-git/anime-sdk/issues"
+    "url": "https://github.com/wandberglima/anime-sdks/issues"
   },
-  "homepage": "https://github.com/hexxt-git/anime-sdk#readme",
+  "homepage": "https://github.com/wandberglima/anime-sdks#readme",
   "keywords": [
     "anime",
     "sdk",
