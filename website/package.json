@@ -11,10 +11,10 @@
   },
   "dependencies": {
     "@astrojs/react": "^5.0.7",
-    "@astrojs/starlight": "^0.40.0",
+    "@astrojs/starlight": "^0.42.4",
     "@fontsource/inter": "^5.2.8",
     "@resvg/resvg-js": "^2.6.2",
-    "astro": "^6.4.5",
+    "astro": "^7.3.5",
     "motion": "^12.40.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
