@@ -1,6 +1,15 @@
 import { BaseProvider, CallOptions } from './BaseProvider.js';
 import { HttpClient } from '../transport/http.js';
-import { aesDecryptCtr } from '../utils/crypto.js';
+import {
+  MKISSA_BUILD_ID,
+  MKISSA_CONTENT_LANE,
+  MKISSA_EPISODE_QUERY_HASH,
+  MKISSA_STATIC_BOOT,
+  MkissaBootstrap,
+  buildAaReq,
+  decryptTobeparsed,
+  deriveKey,
+} from '../utils/allanimeCrypto.js';
 import { Mp4UploadExtractor } from '../extractors/Mp4UploadExtractor.js';
 import { GenericHlsExtractor } from '../extractors/GenericHlsExtractor.js';
 import {
@@ -14,6 +23,10 @@ import {
 
 export interface AllmangaOptions {
   baseUrl?: string;
+  /** Bootstrap origin (defaults to https://api.mkissa.net). */
+  origin?: string;
+  /** Static `x-aa-boot` token; defaults to the build-181 constant. */
+  bootToken?: string;
   /** Default language to use if not specified per-call. Defaults to 'sub'. */
   defaultLanguage?: ContentLanguage;
 }
@@ -36,26 +49,47 @@ function decodeAllAnimeSource(encoded: string): string {
   return decoded.replace(/\/clock(?=\?|$)/, '/clock.json');
 }
 
-const ALLANIME_KEY_PHRASE = 'Xot36i3lK3:v1';
-const ALLANIME_USER_AGENT =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0';
+const MKISSA_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0';
 
+/**
+ * AllAnime / mkissa provider.
+ *
+ * The mkissa backend (`api.mkissa.net`) protects its `episode` resolver with a
+ * signed `aaReq` header (see `utils/allanimeCrypto.ts`). Public queries
+ * (`shows`, `show`) work with just `x-build-id`; the episode resolver needs a
+ * bootstrap key + signed token.
+ *
+ * The backend additionally enforces Cloudflare Turnstile anti-abuse on flagged
+ * clients. When that triggers, responses carry `AA_CRYPTO_STALE` /
+ * `NEED_CAPTCHA`; those are surfaced as-is so the router can fall back to
+ * another provider.
+ */
 export class AllmangaProvider extends BaseProvider {
   public readonly id = 'allmanga';
   public readonly supportedTypes: MediaCatalogType[] = ['ANIME'];
-  private apiBase = 'https://api.allanime.day/api';
-  private apiHost = 'https://allanime.day';
-  private referer = 'https://allmanga.to';
-  private origin = 'https://allmanga.to';
+
+  private apiBase: string;
+  private apiHost: string;
+  private referer: string;
+  private origin: string;
+  private bootToken: string;
   private defaultLanguage: ContentLanguage;
+
+  private bootstrapCache: MkissaBootstrap | null = null;
+  private bootstrapAt = 0;
+
   private mp4UploadExtractor: Mp4UploadExtractor;
   private genericExtractor: GenericHlsExtractor;
 
   constructor(http: HttpClient, options: AllmangaOptions = {}) {
     super(http);
-    if (options.baseUrl) {
-      this.apiBase = options.baseUrl;
-    }
+    const base = options.baseUrl ?? 'https://api.mkissa.net/api';
+    this.apiBase = base;
+    this.apiHost = options.origin ?? base.replace(/\/api\/?$/, '');
+    this.referer = 'https://mkissa.to/';
+    this.origin = 'https://mkissa.to';
+    this.bootToken = options.bootToken ?? MKISSA_STATIC_BOOT;
     this.defaultLanguage = options.defaultLanguage ?? 'sub';
     this.mp4UploadExtractor = new Mp4UploadExtractor(this.http);
     this.genericExtractor = new GenericHlsExtractor(this.http);
@@ -91,6 +125,7 @@ export class AllmangaProvider extends BaseProvider {
     }
 
     const json = (await res.json()) as any;
+    this.throwIfAntiAbuse(json);
     const edges = json?.data?.shows?.edges ?? [];
     const out: IMediaSearchResult[] = [];
 
@@ -131,6 +166,7 @@ export class AllmangaProvider extends BaseProvider {
     }
 
     const json = (await res.json()) as any;
+    this.throwIfAntiAbuse(json);
     const detail = json?.data?.show?.availableEpisodesDetail ?? {};
 
     // Merge sub/dub/raw episode lists into one canonical list keyed by episode
@@ -208,15 +244,56 @@ export class AllmangaProvider extends BaseProvider {
     return { type: 'video', streams };
   }
 
-  // ─── Internals ─────────────────────────────────────────────────────────────
+  // ─── Crypto / bootstrap ─────────────────────────────────────────────────────
 
   private apiHeaders(): Record<string, string> {
     return {
       'Content-Type': 'application/json',
       Referer: this.referer,
       Origin: this.origin,
-      'User-Agent': ALLANIME_USER_AGENT,
+      'User-Agent': MKISSA_USER_AGENT,
     };
+  }
+
+  private graphqlHeaders(): Record<string, string> {
+    return {
+      Referer: this.referer,
+      Origin: this.origin,
+      'User-Agent': MKISSA_USER_AGENT,
+      'x-build-id': MKISSA_BUILD_ID,
+    };
+  }
+
+  /**
+   * Fetch (and cache) the epoch bootstrap. `x-aa-boot` is required and is a
+   * static build-181 token; the response carries the `partB` used to derive
+   * the AES key.
+   */
+  private async fetchBootstrap(signal?: AbortSignal): Promise<MkissaBootstrap> {
+    const fresh = this.bootstrapCache && Date.now() - this.bootstrapAt < 4 * 60 * 1000;
+    if (fresh) return this.bootstrapCache!;
+
+    const url = `${this.apiHost}/client-crypto/v1/bootstrap?buildId=${MKISSA_BUILD_ID}&k=${MKISSA_CONTENT_LANE}`;
+    const res = await this.http.get(url, {
+      headers: {
+        Referer: this.referer,
+        Origin: this.origin,
+        'User-Agent': MKISSA_USER_AGENT,
+        'x-build-id': MKISSA_BUILD_ID,
+        'x-aa-boot': this.bootToken,
+      },
+      signal,
+    });
+    if (res.status !== 200) {
+      throw new Error(
+        `AllManga crypto bootstrap failed (${res.status}). The static boot token may have rotated.`,
+      );
+    }
+    const body = (await res.json()) as MkissaBootstrap;
+    if (!body?.partB) throw new Error('AllManga crypto bootstrap returned no partB');
+    this.bootstrapCache = body;
+    this.bootstrapAt = Date.now();
+    return body;
   }
 
   private async fetchEpisodeSources(
@@ -226,77 +303,84 @@ export class AllmangaProvider extends BaseProvider {
     signal?: AbortSignal,
   ): Promise<Array<{ sourceUrl: string; sourceName?: string; priority?: number }>> {
     const variables = { showId, translationType: lang, episodeString };
-    const extensions = {
-      persistedQuery: {
-        version: 1,
-        sha256Hash: 'd405d0edd690624b66baba3068e0edc3ac90f1597d898a1ec8db4e5c43c00fec',
-      },
-    };
 
-    const url = `${this.apiBase}?variables=${encodeURIComponent(
-      JSON.stringify(variables),
-    )}&extensions=${encodeURIComponent(JSON.stringify(extensions))}`;
+    // Retry once on AA_CRYPTO_STALE (the site itself re-bootstraps after one).
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt > 0) this.bootstrapCache = null;
 
-    const res = await this.http.get(url, { headers: this.apiHeaders(), signal });
-    if (res.status !== 200) {
-      throw new Error(`Failed to load AllManga stream sources: ${res.status}`);
+      const bootstrap = await this.fetchBootstrap(signal);
+      const key = deriveKey(bootstrap);
+      const aaReq = await buildAaReq(key, bootstrap.epoch, MKISSA_EPISODE_QUERY_HASH);
+
+      const extensions = {
+        persistedQuery: { version: 1, sha256Hash: MKISSA_EPISODE_QUERY_HASH },
+        k: MKISSA_CONTENT_LANE,
+        aaReq,
+      };
+
+      const url = `${this.apiBase}?variables=${encodeURIComponent(
+        JSON.stringify(variables),
+      )}&extensions=${encodeURIComponent(JSON.stringify(extensions))}`;
+
+      const res = await this.http.get(url, { headers: this.graphqlHeaders(), signal });
+      if (res.status !== 200) {
+        throw new Error(`Failed to load AllManga stream sources: ${res.status}`);
+      }
+      const json = (await res.json()) as any;
+
+      const code = json?.errors?.[0]?.extensions?.code ?? json?.errors?.[0]?.message;
+      if (code === 'AA_CRYPTO_STALE' && attempt === 0) {
+        continue;
+      }
+      this.throwIfAntiAbuse(json);
+
+      const tobeparsed: string | undefined = json?.data?.tobeparsed;
+      if (tobeparsed) {
+        return this.parseTobeparsed(key, tobeparsed);
+      }
+
+      // Non-encrypted shape (older builds): sourceUrls directly.
+      const direct = json?.data?.episode?.sourceUrls;
+      if (Array.isArray(direct)) return direct;
     }
-    const json = (await res.json()) as any;
 
-    const tobeparsed: string | undefined = json?.data?.tobeparsed;
-    if (tobeparsed) {
-      return this.decryptTobeparsed(tobeparsed);
-    }
-
-    // Fallback to non-persisted GraphQL request
-    const fallbackQuery = `query ($showId: String!, $translationType: VaildTranslationTypeEnumType!, $episodeString: String!) { episode(showId: $showId translationType: $translationType episodeString: $episodeString) { episodeString sourceUrls } }`;
-    const fbRes = await this.http.post(
-      this.apiBase,
-      { variables, query: fallbackQuery },
-      { headers: this.apiHeaders(), signal },
-    );
-    if (fbRes.status !== 200) {
-      throw new Error(`AllManga fallback GraphQL failed with status ${fbRes.status}`);
-    }
-    const fbJson = (await fbRes.json()) as any;
-    return fbJson?.data?.episode?.sourceUrls ?? [];
+    throw new Error('AllManga episode request did not return sources after retry');
   }
 
-  private async decryptTobeparsed(blob: string): Promise<any[]> {
-    let binary: string;
-    try {
-      binary = atob(blob);
-    } catch {
-      const norm = blob.replace(/-/g, '+').replace(/_/g, '/');
-      const pad = norm.length % 4;
-      binary = atob(pad ? norm + '='.repeat(4 - pad) : norm);
-    }
-    const data = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) data[i] = binary.charCodeAt(i);
-
-    if (data.length < 30) {
-      throw new Error(`tobeparsed blob too short (${data.length} bytes)`);
-    }
-
-    const nonce = data.subarray(1, 13);
-    const ciphertext = data.subarray(13, data.length - 16);
-    const keyBytes = new TextEncoder().encode(ALLANIME_KEY_PHRASE);
-    const keyHash = await globalThis.crypto.subtle.digest('SHA-256', keyBytes);
-    const key = new Uint8Array(keyHash);
-    const iv = new Uint8Array(16);
-    iv.set(nonce, 0);
-    new DataView(iv.buffer).setUint32(12, 2, false);
-
-    const decrypted = await aesDecryptCtr(ciphertext, key, iv);
-    const text = new TextDecoder().decode(decrypted);
+  private async parseTobeparsed(
+    key: Uint8Array,
+    blob: string,
+  ): Promise<Array<{ sourceUrl: string; sourceName?: string; priority?: number }>> {
+    const text = await decryptTobeparsed(key, blob);
     const parsed = JSON.parse(text);
-
-    const sources = parsed.episode?.sourceUrls ?? parsed.data?.episode?.sourceUrls ?? null;
+    const sources = parsed?.episode?.sourceUrls ?? parsed?.data?.episode?.sourceUrls ?? null;
     if (!Array.isArray(sources)) {
       throw new Error('No sourceUrls in decrypted tobeparsed payload');
     }
     return sources;
   }
+
+  /**
+   * The backend signals anti-abuse as a GraphQL error (`NEED_CAPTCHA`,
+   * `AA_CRYPTO_MISSING`, …). Bubble those up verbatim so the router can
+   * fall back instead of reporting a generic failure.
+   */
+  private throwIfAntiAbuse(json: any): void {
+    const err = json?.errors?.[0];
+    if (!err) return;
+    const code = err?.extensions?.code ?? err?.message;
+    if (typeof code === 'string' && code.startsWith('AA_CRYPTO')) {
+      throw new Error(`AllManga blocked by anti-abuse: ${code}`);
+    }
+    if (
+      typeof code === 'string' &&
+      (code === 'NEED_CAPTCHA' || String(err.message).includes('NEED_CAPTCHA'))
+    ) {
+      throw new Error('AllManga requires CAPTCHA (anti-abuse): NEED_CAPTCHA');
+    }
+  }
+
+  // ─── Source extraction ───────────────────────────────────────────────────────
 
   private async extractSource(
     src: { sourceUrl: string; sourceName?: string },
@@ -314,7 +398,7 @@ export class AllmangaProvider extends BaseProvider {
 
     const headers = {
       Referer: this.referer,
-      'User-Agent': ALLANIME_USER_AGENT,
+      'User-Agent': MKISSA_USER_AGENT,
     };
 
     // 1. Internal AllAnime clock.json: returns JSON with `links` array.
@@ -375,7 +459,7 @@ export class AllmangaProvider extends BaseProvider {
       const res = await this.http.get(url, {
         headers: {
           Referer: this.referer,
-          'User-Agent': ALLANIME_USER_AGENT,
+          'User-Agent': MKISSA_USER_AGENT,
         },
         signal: controller.signal as any,
       });

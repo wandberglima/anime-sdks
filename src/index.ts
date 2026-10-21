@@ -33,6 +33,7 @@ export * from './providers/MangapillProvider.js';
 
 // Utilities
 export * from './utils/crypto.js';
+export * from './utils/allanimeCrypto.js';
 export * from './utils/subtitles.js';
 export * from './utils/urn.js';
 
